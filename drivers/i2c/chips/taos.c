@@ -25,7 +25,7 @@ Wenn               Wer          Was                                             
 #include <asm/delay.h>
 #include <linux/irq.h>
 #include <asm/gpio.h>
-#include <linux/i2c/taos_common.h>
+#include <linux/i2c/PS_ALS_common.h>
 #include <linux/input.h>
 #include <linux/miscdevice.h>
 
@@ -101,10 +101,12 @@ Wenn               Wer          Was                                             
 #define TAOS_TRITON_STATUS_PRXINTR	0x20
 
 // lux constants
-#define	TAOS_MAX_LUX			65535000
+//[sensor wlg 20110729]ALS thereshold modify
+//#define	TAOS_MAX_LUX			65535000
+#define	TAOS_MAX_LUX			10240
 #define TAOS_SCALE_MILLILUX		3
 #define TAOS_FILTER_DEPTH		3
-
+#define THRES_LO_TO_HI_RATIO  4/5
 // forward declarations
 static int taos_probe(struct i2c_client *clientp, const struct i2c_device_id *idp);
 static int taos_remove(struct i2c_client *client);
@@ -117,7 +119,7 @@ static loff_t taos_llseek(struct file *file, loff_t offset, int orig);
 static int taos_get_lux(void);
 static int taos_lux_filter(int raw_lux);
 static int taos_device_name(unsigned char *bufp, char **device_name);
-static int taos_prox_poll(struct taos_prox_info *prxp);
+static int taos_prox_poll(struct PS_ALS_prox_info *prxp);
 //static void taos_prox_poll_timer_func(unsigned long param);
 //static void taos_prox_poll_timer_start(void);
 //static void taos_als_work(struct work_struct *w);
@@ -178,7 +180,6 @@ static struct i2c_driver taos_driver = {
 	.remove = __devexit_p(taos_remove),
 };
 
-
 struct taos_intr_data {
     int int_gpio;
     int irq;
@@ -197,6 +198,7 @@ struct taos_data {
     	struct taos_intr_data *pdata;
 	struct work_struct  taos_work;
 	enum taos_chip_type chip_type;
+	struct mutex proximity_calibrating;
 } *taos_datap;
 
 static struct taos_intr_data taos_irq= {
@@ -217,7 +219,7 @@ static struct file_operations taos_fops = {
 };
 
 // device configuration
-struct taos_cfg *taos_cfgp;
+struct PS_ALS_cfg *taos_cfgp;
 static u32 calibrate_target_param = 300000;
 static u16 als_time_param = 27;
 static u16 scale_factor_param = 1;
@@ -227,8 +229,8 @@ static u8 gain_param = 1;
 
 #if defined(CONFIG_MACH_BLADE)
 static u16 gain_trim_param = 25;
-#elif defined(CONFIG_MACH_JOE)
-static u16 gain_trim_param = 25;
+#elif defined(CONFIG_MACH_RACER2)
+static u16 gain_trim_param = 50;
 #elif defined(CONFIG_MACH_SKATE)
 static u16 gain_trim_param = 240;
 #elif defined(CONFIG_MACH_ROAMER)
@@ -240,7 +242,7 @@ static u16 gain_trim_param = 25; //this value is set according to specific devic
 #endif
 
 static u16 prox_threshold_hi_param = 1023; 
-static u16 prox_threshold_lo_param = 1023;
+static u16 prox_threshold_lo_param = 818;
 static u8 prox_int_time_param = 0xF6;
 static u8 prox_adc_time_param = 0xFF;
 static u8 prox_wait_time_param = 0xFF;
@@ -261,9 +263,9 @@ int g_nlux = 0;
 		
 
 // prox info
-struct taos_prox_info prox_cal_info[20];
-struct taos_prox_info prox_cur_info;
-struct taos_prox_info *prox_cur_infop = &prox_cur_info;
+struct PS_ALS_prox_info prox_cal_info[20];
+struct PS_ALS_prox_info prox_cur_info;
+struct PS_ALS_prox_info *prox_cur_infop = &prox_cur_info;
 //static u8 prox_history_hi = 0;
 //static u8 prox_history_lo = 0;
 //static struct timer_list prox_poll_timer;
@@ -300,6 +302,20 @@ struct lux_data TritonFN_lux_data[] = {
 struct lux_data *lux_tablep = TritonFN_lux_data;
 static int lux_history[TAOS_FILTER_DEPTH] = {-ENODATA, -ENODATA, -ENODATA};
 
+//prox data
+struct prox_data {
+	u16	ratio;
+	u16	hi;
+	u16	lo;
+};
+struct prox_data TritonFN_prox_data[] = {
+        { 1,  22,  20 },
+        { 3, 20, 16 },
+        { 6, 18, 14 },
+        { 10, 16,  16 },      
+        { 0,  0,   0 }
+};
+struct prox_data *prox_tablep = TritonFN_prox_data;
 
 /* ----------------------*
 * config gpio for intr utility        *
@@ -369,6 +385,8 @@ static void do_taos_work(struct work_struct *w)
 	}	
 	if(g_nlux>=0)	
 		taos_report_value(0);
+	//if(prox_on&&(prox_cur_infop->prox_event == 1)&&(g_nlux>1000*(taos_cfgp->gain_trim)))
+		//goto turn_screen_on;
     }
 	
     //prox interrupt
@@ -439,14 +457,15 @@ for data poll utility in hardware\alsprox.c
 */
 static void taos_report_value(int mask)
 {
-	struct taos_prox_info *val = prox_cur_infop;
+	struct PS_ALS_prox_info *val = prox_cur_infop;
 	int lux_val=g_nlux;
 	int  dist;
 	lux_val/=taos_cfgp->gain_trim;	
 
 	if (mask==0) {
 		input_report_abs(light->input_dev, ABS_MISC, lux_val);
-		printk(KERN_CRIT "TAOS: als_interrupt =%d\n",  lux_val);
+//[sensor wlg 20110729]ALS thereshold modify add log
+// 		printk(KERN_CRIT "TAOS: als_interrupt lux_val(%d)=g_nlux(%d)/taos_cfgp->gain_trim(%d)\n", lux_val, g_nlux, taos_cfgp->gain_trim);
 		input_sync(light->input_dev);
 	}
 
@@ -511,6 +530,7 @@ static void __exit taos_exit(void) {
 	device_destroy(taos_class, MKDEV(MAJOR(taos_dev_number), 0));
 	cdev_del(&taos_datap->cdev);
 	class_destroy(taos_class);
+	mutex_destroy(&taos_datap->proximity_calibrating);
         kfree(taos_datap);
 }
 
@@ -588,7 +608,7 @@ static int taos_probe(struct i2c_client *clientp, const struct i2c_device_id *id
 	
 	
 	INIT_WORK(&taos_datap->taos_work, do_taos_work); 
-
+	mutex_init(&taos_datap->proximity_calibrating);
 	taos_datap->pdata = &taos_irq;
 	if(clientp->irq){		
 		taos_datap->pdata->irq=taos_datap->client->irq;
@@ -614,8 +634,8 @@ static int taos_probe(struct i2c_client *clientp, const struct i2c_device_id *id
 	taos_datap->valid = 0;
 	
 	init_MUTEX(&taos_datap->update_lock);
-	if (!(taos_cfgp = kmalloc(sizeof(struct taos_cfg), GFP_KERNEL))) {
-		printk(KERN_ERR "TAOS: kmalloc for struct taos_cfg failed in taos_probe()\n");
+	if (!(taos_cfgp = kmalloc(sizeof(struct PS_ALS_cfg), GFP_KERNEL))) {
+		printk(KERN_ERR "TAOS: kmalloc for struct PS_ALS_cfg failed in taos_probe()\n");
 		return -ENOMEM;
 	}	
 
@@ -1009,11 +1029,15 @@ static int taos_ioctl(struct inode *inode, struct file *file, unsigned int cmd, 
 	int prox_sum = 0, prox_mean = 0, prox_max = 0;
 	int lux_val = 0, ret = 0, i = 0, tmp = 0;
 	u16 gain_trim_val = 0;
-	u8 reg_val = 0;
-
+	u8 reg_val = 0, prox_pulse=0, prox_gain=0;
+	int count=0;
+	struct prox_data *prox_pt;
+	u16 ratio;
 	taos_datap = container_of(inode->i_cdev, struct taos_data, cdev);
+//[sensor wlg 20110729]ALS thereshold modify add log
+//printk(KERN_ERR "TAOS_wlg: taos_ioctl() cmd=%d\n", cmd);
 	switch (cmd) {
-		case TAOS_IOCTL_ALS_ON:
+		case PS_ALS_IOCTL_ALS_ON:
 			if(prox_on)
 				break;
 			ret=enable_light_and_proximity(0x10);
@@ -1024,7 +1048,7 @@ static int taos_ioctl(struct inode *inode, struct file *file, unsigned int cmd, 
 			}			
 			return (ret);
 			break;
-                case TAOS_IOCTL_ALS_OFF:	
+                case PS_ALS_IOCTL_ALS_OFF:	
 			if(prox_on)
 				break;
                         for (i = 0; i < TAOS_FILTER_DEPTH; i++)
@@ -1038,7 +1062,7 @@ static int taos_ioctl(struct inode *inode, struct file *file, unsigned int cmd, 
 			}			
 			return (ret);
                 	break;
-		case TAOS_IOCTL_ALS_DATA:
+		case PS_ALS_IOCTL_ALS_DATA:
                         if ((ret = (i2c_smbus_write_byte(taos_datap->client, (TAOS_TRITON_CMD_REG | TAOS_TRITON_CNTRL)))) < 0) {
                                 printk(KERN_ERR "TAOS: i2c_smbus_write_byte failed in ioctl als_data\n");
                                 return (ret);
@@ -1058,7 +1082,7 @@ static int taos_ioctl(struct inode *inode, struct file *file, unsigned int cmd, 
 			lux_val = taos_lux_filter(lux_val);
 			return (lux_val);
 			break;
-		case TAOS_IOCTL_ALS_CALIBRATE:
+		case PS_ALS_IOCTL_ALS_CALIBRATE:
                         if ((ret = (i2c_smbus_write_byte(taos_datap->client, (TAOS_TRITON_CMD_REG | TAOS_TRITON_CNTRL)))) < 0) {
                                 printk(KERN_ERR "TAOS: i2c_smbus_write_byte failed in ioctl als_calibrate\n");
                                 return (ret);
@@ -1082,16 +1106,16 @@ static int taos_ioctl(struct inode *inode, struct file *file, unsigned int cmd, 
 			return ((int)gain_trim_val);
 			break;
 			
-		case TAOS_IOCTL_CONFIG_GET:
-			ret = copy_to_user((struct taos_cfg *)arg, taos_cfgp, sizeof(struct taos_cfg));
+		case PS_ALS_IOCTL_CONFIG_GET:
+			ret = copy_to_user((struct PS_ALS_cfg *)arg, taos_cfgp, sizeof(struct PS_ALS_cfg));
 			if (ret) {
 				printk(KERN_ERR "TAOS: copy_to_user failed in ioctl config_get\n");
 				return -ENODATA;
 			}
 			return (ret);
 			break;
-                case TAOS_IOCTL_CONFIG_SET:
-                        ret = copy_from_user(taos_cfgp, (struct taos_cfg *)arg, sizeof(struct taos_cfg));
+                case PS_ALS_IOCTL_CONFIG_SET:
+                        ret = copy_from_user(taos_cfgp, (struct PS_ALS_cfg *)arg, sizeof(struct PS_ALS_cfg));
 			if (ret) {
 				printk(KERN_ERR "TAOS: copy_from_user failed in ioctl config_set\n");
                                 return -ENODATA;
@@ -1104,8 +1128,10 @@ static int taos_ioctl(struct inode *inode, struct file *file, unsigned int cmd, 
         		taos_cfgp->als_time = tmp*50;
 		        sat_als = (256 - taos_cfgp->prox_int_time) << 10;
 	       		sat_prox = (256 - taos_cfgp->prox_adc_time) << 10;
+			if(!taos_cfgp->prox_pulse_cnt)
+				taos_cfgp->prox_pulse_cnt=prox_pulse_cnt_param;
                 	break;
-		case TAOS_IOCTL_PROX_ON:				
+		case PS_ALS_IOCTL_PROX_ON:				
 			ret=enable_light_and_proximity(0x01);
 			if(ret>=0)
 			{
@@ -1114,7 +1140,7 @@ static int taos_ioctl(struct inode *inode, struct file *file, unsigned int cmd, 
 			}	
 			return ret;	
 			break;
-                case TAOS_IOCTL_PROX_OFF:
+                case PS_ALS_IOCTL_PROX_OFF:
 			ret=enable_light_and_proximity(0x02);
 			if(ret>=0)
 			{
@@ -1123,49 +1149,126 @@ static int taos_ioctl(struct inode *inode, struct file *file, unsigned int cmd, 
 			}	
 			return ret;	
 			break;
-		case TAOS_IOCTL_PROX_DATA:
-                        ret = copy_to_user((struct taos_prox_info *)arg, prox_cur_infop, sizeof(struct taos_prox_info));
+		case PS_ALS_IOCTL_PROX_DATA:
+                        ret = copy_to_user((struct PS_ALS_prox_info *)arg, prox_cur_infop, sizeof(struct PS_ALS_prox_info));
                         if (ret) {
                                 printk(KERN_ERR "TAOS: copy_to_user failed in ioctl prox_data\n");
                                 return -ENODATA;
                         }
                         return (ret);
                         break;
-                case TAOS_IOCTL_PROX_EVENT:
+                case PS_ALS_IOCTL_PROX_EVENT:
  			return (prox_cur_infop->prox_event);
                         break;
-		case TAOS_IOCTL_PROX_CALIBRATE:
+		case PS_ALS_IOCTL_PROX_CALIBRATE:
 			if (!prox_on)			
 			 {
 				printk(KERN_ERR "TAOS: ioctl prox_calibrate was called before ioctl prox_on was called\n");
 				return -EPERM;
 			}
-			prox_sum = 0;
-			prox_max = 0;
-			for (i = 0; i < 20; i++) {
+
+			mutex_lock(&taos_datap->proximity_calibrating);
+			count=0;
+			prox_pulse=prox_pulse_cnt_param;
+			prox_gain=prox_gain_param;
+			if ((ret = (i2c_smbus_write_byte_data(taos_datap->client, (TAOS_TRITON_CMD_REG|0x0E), prox_pulse))) < 0) {
+                          printk(KERN_ERR "TAOS: i2c_smbus_write_byte_data failed\n");
+                          
+			}
+			if ((ret = (i2c_smbus_write_byte(taos_datap->client, (TAOS_TRITON_CMD_REG | TAOS_TRITON_GAIN)))) < 0) {
+                                printk(KERN_ERR "TAOS: i2c_smbus_write_byte failed in ioctl prox_on\n");
+                                
+			}
+			reg_val = i2c_smbus_read_byte(taos_datap->client);
+			reg_val = reg_val & 0x03;
+			reg_val = reg_val | (prox_gain & 0xFC);
+			if ((ret = (i2c_smbus_write_byte_data(taos_datap->client, (TAOS_TRITON_CMD_REG | TAOS_TRITON_GAIN), reg_val))) < 0) {
+                                printk(KERN_ERR "TAOS: i2c_smbus_write_byte_data failed in ioctl prox gain\n");
+                                
+			}	
+			msleep(50);	
+			do{			
+				prox_sum = 0;
+				prox_max = 0;
+				prox_mean = 0;
+				count++;
+				for (i = 0; i < 20; i++) {
 	                        if ((ret = taos_prox_poll(&prox_cal_info[i])) < 0) {
         	                        printk(KERN_ERR "TAOS: call to prox_poll failed in ioctl prox_calibrate\n");
+						mutex_unlock(&taos_datap->proximity_calibrating);			
                 	                return (ret);
-                        	}
-						
-				prox_sum += prox_cal_info[i].prox_data;
-				if (prox_cal_info[i].prox_data > prox_max)
-					prox_max = prox_cal_info[i].prox_data;
-				mdelay(100);
-			}
-			prox_mean = prox_sum/20;
-			
+                        		}					
+					prox_sum += prox_cal_info[i].prox_data;
+					if (prox_cal_info[i].prox_data > prox_max)
+						prox_max = prox_cal_info[i].prox_data;
+					msleep(50);
+				}
+				prox_mean = prox_sum/20;
+				
+				if(taos_datap->chip_type==TMD2771){				
+				ratio = 10*prox_mean/sat_prox;
+				
+				for (prox_pt = prox_tablep; prox_pt->ratio && prox_pt->ratio <= ratio; prox_pt++);
+        		if(!prox_pt->ratio)
+                	return -1;
+					 
+				taos_cfgp->prox_threshold_hi = (prox_mean*prox_pt->hi)/10;
+				taos_cfgp->prox_threshold_lo = taos_cfgp->prox_threshold_hi*THRES_LO_TO_HI_RATIO;	
+				}
+				else{
 				taos_cfgp->prox_threshold_hi = 15*prox_mean/10;
-				taos_cfgp->prox_threshold_lo = 12*prox_mean/10;			
-			
-			if (taos_cfgp->prox_threshold_lo < ((sat_prox*12)/100)) {
-				taos_cfgp->prox_threshold_lo = ((sat_prox*12)/100);
-				taos_cfgp->prox_threshold_hi = ((sat_prox*15)/100);
+				taos_cfgp->prox_threshold_lo = taos_cfgp->prox_threshold_hi*THRES_LO_TO_HI_RATIO;	
+				}
+				if(taos_cfgp->prox_threshold_hi>=sat_prox){
+					prox_pulse-=1;	
+					if(prox_pulse<1){
+						prox_pulse=1;
+						count=10;
+						if(prox_gain==0x20)
+							count--;
+						prox_gain=0x60;
+						if ((ret = (i2c_smbus_write_byte(taos_datap->client, (TAOS_TRITON_CMD_REG | TAOS_TRITON_GAIN)))) < 0) {
+                                		printk(KERN_ERR "TAOS: i2c_smbus_write_byte failed in ioctl prox_on\n");
+                                		
+						}
+						reg_val = i2c_smbus_read_byte(taos_datap->client);
+						reg_val = reg_val & 0x03;
+						reg_val = reg_val | (prox_gain & 0xFC);
+						if ((ret = (i2c_smbus_write_byte_data(taos_datap->client, (TAOS_TRITON_CMD_REG | TAOS_TRITON_GAIN), reg_val))) < 0) {
+                                		printk(KERN_ERR "TAOS: i2c_smbus_write_byte_data failed in ioctl prox gain\n");
+                                	
+						}				
+						}
+					}	
+				if(taos_cfgp->prox_threshold_hi<=(sat_prox*2/5)){
+					prox_pulse+=1;	
+					if(taos_datap->chip_type==TMD2771){
+						count=10;
+						prox_pulse--;	
+						}
+					if(prox_pulse>20){
+						prox_pulse=20;
+						count=10;
+						}
+					}
+				printk(KERN_ERR "taos:prox_pulse_cnt_param=%d\n",prox_pulse);
+				if ((ret = (i2c_smbus_write_byte_data(taos_datap->client, (TAOS_TRITON_CMD_REG|0x0E), prox_pulse))) < 0) {
+                          	printk(KERN_ERR "TAOS: i2c_smbus_write_byte_data failed\n");
+                          	
+				}	           	
+				msleep(50);	
+			}while(((taos_cfgp->prox_threshold_hi>=sat_prox)||(taos_cfgp->prox_threshold_hi<(sat_prox*2/5)))&&(count<10));
+
+			taos_cfgp->prox_pulse_cnt = prox_pulse;	
+			taos_cfgp->prox_gain = prox_gain;	
+			if (taos_cfgp->prox_threshold_lo < ((sat_prox*15)/100)) {				
+				taos_cfgp->prox_threshold_hi = ((sat_prox*20)/100);
+				taos_cfgp->prox_threshold_lo = (taos_cfgp->prox_threshold_hi *THRES_LO_TO_HI_RATIO);
 			}
 			
-			if ((ret = (i2c_smbus_write_byte(taos_datap->client, (TAOS_TRITON_CMD_REG|TAOS_TRITON_CMD_SPL_FN|TAOS_TRITON_CMD_PROX_INTCLR)))) < 0) {
-                		printk(KERN_ERR "TAOS: i2c_smbus_write_byte failed in ioctl als_on\n");
-                		return (ret);
+			if ((ret = (i2c_smbus_write_byte(taos_datap->client, (TAOS_TRITON_CMD_REG|TAOS_TRITON_CMD_SPL_FN|TAOS_TRITON_CMD_PROXALS_INTCLR)))) < 0) {
+                		printk(KERN_ERR "TAOS: i2c_smbus_write_byte failed\n");
+                		
             		}
 			if ((ret = (i2c_smbus_write_word_data(taos_datap->client, (0xA0 | TAOS_TRITON_PRX_MAXTHRESHLO),taos_cfgp->prox_threshold_hi))) < 0) {    	       
 				pr_crit(TAOS_TAG "i2c_smbus_write_byte() to TAOS_TRITON_PRX_MAXTHRESHLO\n");            			      	 
@@ -1173,14 +1276,20 @@ static int taos_ioctl(struct inode *inode, struct file *file, unsigned int cmd, 
 			if ((ret = (i2c_smbus_write_word_data(taos_datap->client, (0xA0 | TAOS_TRITON_PRX_MINTHRESHLO),taos_cfgp->prox_threshold_lo))) < 0) {    	       
 				pr_crit(TAOS_TAG "i2c_smbus_write_byte() to TAOS_TRITON_PRX_MINTHRESHLO\n");            			      	 
 			}  
-			
+			reg_val=light_on? 0x3F:0x2F;
+			if ((ret = (i2c_smbus_write_byte_data(taos_datap->client, (TAOS_TRITON_CMD_REG|0x00), reg_val))) < 0) { 
+                		printk(KERN_ERR "TAOS: i2c_smbus_write_byte_data failed\n");
+                		
+            		}	
+			mutex_unlock(&taos_datap->proximity_calibrating);
 			pr_crit(KERN_ERR "taos prox_cal_threshold_hi=%d,prox_cal_threshold_lo=%d\n",taos_cfgp->prox_threshold_hi,taos_cfgp->prox_threshold_lo);
+			return (ret);
 			break;
 					
-		case TAOS_IOCTL_PROX_GET_ENABLED:
+		case PS_ALS_IOCTL_PROX_GET_ENABLED:
 			return put_user(prox_on, (unsigned long __user *)arg);
 			break;	
-		case TAOS_IOCTL_ALS_GET_ENABLED:
+		case PS_ALS_IOCTL_ALS_GET_ENABLED:
 			return put_user(light_on, (unsigned long __user *)arg);
 			break;
 			
@@ -1209,6 +1318,8 @@ static int taos_get_lux(void) {
                 	return (ret);
         	}
         	chdata[i] = i2c_smbus_read_byte(taos_datap->client);
+//[sensor wlg 20110729]ALS thereshold modify	
+//		printk(KERN_ERR "TAOS_wlg: i2c_smbus_read_byte() i=%d ret=%d \n", i, chdata[i]);
 	}
 	
 	tmp = (taos_cfgp->als_time + 25)/50;
@@ -1225,9 +1336,18 @@ static int taos_get_lux(void) {
 	raw_ir    = chdata[3];
 	raw_ir    <<= 8;
 	raw_ir    |= chdata[2];
-	
-	als_intr_threshold_hi_param = raw_clear + raw_clear/5;
-    	als_intr_threshold_lo_param = raw_clear - raw_clear/5;
+//[sensor wlg 20110729]ALS thereshold modify	
+    if( raw_clear < ((TAOS_MAX_LUX*5)>>2))
+    {
+    	als_intr_threshold_hi_param = raw_clear + (raw_clear>>2);
+    	als_intr_threshold_lo_param = raw_clear - (raw_clear>>2);
+    }
+    else
+    {
+        als_intr_threshold_hi_param = raw_clear + (TAOS_MAX_LUX>>2);        
+        als_intr_threshold_lo_param = TAOS_MAX_LUX;
+    }
+printk(KERN_ERR "TAOS: lux_timep->saturation=%d hi=%d lo=%d\n", lux_timep->saturation, als_intr_threshold_hi_param, als_intr_threshold_lo_param);
 
 	//update threshold 
     	//printk(TAOS_TAG "als_intr_threshold_hi_param=%x,als_intr_threshold_lo_param=%x\n",als_intr_threshold_hi_param,als_intr_threshold_lo_param);
@@ -1247,9 +1367,9 @@ static int taos_get_lux(void) {
 	raw_ir *= taos_cfgp->scale_factor;
 	dev_gain = taos_triton_gain_table[taos_cfgp->gain & 0x3];
         if(raw_clear >= lux_timep->saturation)
-                return(TAOS_MAX_LUX);
+                return((TAOS_MAX_LUX)*(taos_cfgp->gain_trim));//[sensor wlg 20110729]ALS thereshold modify
         if(raw_ir >= lux_timep->saturation)
-                return(TAOS_MAX_LUX);
+                return((TAOS_MAX_LUX)*(taos_cfgp->gain_trim));//[sensor wlg 20110729]ALS thereshold modify
         if(raw_clear == 0)
                 return(0);
         if(dev_gain == 0 || dev_gain > 127) {
@@ -1268,8 +1388,9 @@ static int taos_get_lux(void) {
 	lux = ((lux + (lux_timep->denominator >>1))/lux_timep->denominator) * lux_timep->numerator;
         lux = (lux + (dev_gain >> 1))/dev_gain;
 	lux >>= TAOS_SCALE_MILLILUX;
-        if(lux > TAOS_MAX_LUX)
-                lux = TAOS_MAX_LUX;
+//[sensor wlg 20110729]ALS thereshold modify
+        if(lux > (TAOS_MAX_LUX)*(taos_cfgp->gain_trim))
+                lux = (TAOS_MAX_LUX)*(taos_cfgp->gain_trim);
 	return(lux);
 }
 
@@ -1320,7 +1441,7 @@ static void taos_chip_diff_settings()
 }
 
 // proximity poll
-static int taos_prox_poll(struct taos_prox_info *prxp) {
+static int taos_prox_poll(struct PS_ALS_prox_info *prxp) {
 	//static int event = 0;
         //u16 status = 0;
         int i = 0, ret = 0;//wait_count = 0

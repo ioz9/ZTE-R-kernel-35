@@ -23,16 +23,6 @@ config GENERIC_FIND_LAST_BIT
 	bool
 	default y
 
-
-config DEBUG_SECTION_MISMATCH
-	bool "Enable full Section mismatch analysis"
-	default y
-	# This option is on purpose disabled for now.
-	# It will be enabled when we are down to a reasonable number
-	# of section mismatch warnings (< 10 for an allyesconfig build)
-	help
-	  The section mismatch analysis checks if there are illegal
-
 config CRC_CCITT
 	tristate "CRC-CCITT functions"
 	help
